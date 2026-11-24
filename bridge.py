@@ -90,6 +90,8 @@ class CamPlayer:
         self._active_conns = set()
         self._last_rx = 0.0
         self._rx_bytes = 0
+        self._current_url = None
+        self._vol_timer = None
 
     def _watchdog(self):
         # chiude iniezioni rimaste mute (player fermo in LMS, stream senza dati)
@@ -171,8 +173,18 @@ class CamPlayer:
         elif op == 'audg' and len(p) >= 18:
             adjust, gainL = p[8], struct.unpack('>I', p[10:14])[0]
             if adjust and gainL:
-                self.vol = max(0.0, min(1.0, gainL / 100.0))
-                log.info('%s: volume %.2f', self.name, self.vol)
+                new = max(0.0, min(1.0, gainL / 100.0))
+                if abs(new - self.vol) > 0.03:
+                    self.vol = new
+                    log.info('%s: volume %.2f', self.name, self.vol)
+                    if self.playing and self._current_url:
+                        # volume live: riavvia il flusso col nuovo volume (debounce 2.5s)
+                        if self._vol_timer:
+                            self._vol_timer.cancel()
+                        t = threading.Timer(2.5, self._restart_with_volume)
+                        t.daemon = True
+                        t.start()
+                        self._vol_timer = t
         elif op == 'strm':
             cmd = chr(p[0]) if p else ''
             if cmd in ('q', 'f'):
@@ -208,9 +220,10 @@ class CamPlayer:
         return int((time.time() - self.start_ts) * 1000) if self.playing else 0
 
     def start_play(self, url):
+        self._current_url = url
         self.stop_play()
         self.proc = subprocess.Popen([
-            'ffmpeg', '-loglevel', 'error', '-re', '-rw_timeout', '8000000', '-i', url,
+            'ffmpeg', '-loglevel', 'error', '-re', '-rw_timeout', '8000000', '-fflags', 'nobuffer', '-i', url,
             '-af', 'volume=%.2f' % self.vol, '-ar', '24000', '-ac', '1',
             '-f', 'mp3', '-b:a', '96k', 'pipe:1'
         ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -225,6 +238,12 @@ class CamPlayer:
             log.info('%s: audio injected into %s', self.name, self.stream)
         except Exception as e:
             log.warning('%s: inject failed: %s', self.name, e)
+
+    def _restart_with_volume(self):
+        url = self._current_url
+        if url and self.playing:
+            log.info('%s: riavvio flusso con volume %.2f', self.name, self.vol)
+            self.start_play(url)
 
     def stop_play(self):
         self.playing = False
