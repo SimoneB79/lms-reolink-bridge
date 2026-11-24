@@ -88,6 +88,15 @@ class CamPlayer:
         self.http_thread = None
         self._http_lock = threading.Lock()
         self._active_conns = set()
+        self._last_rx = 0.0
+
+    def _watchdog(self):
+        # chiude iniezioni rimaste mute (player fermo in LMS, stream senza dati)
+        while True:
+            time.sleep(5)
+            if self.playing and self._last_rx and time.time() - self._last_rx > 15:
+                log.info('%s: flusso fermo da 15s, chiudo iniezione', self.name)
+                self.stop_play()
 
     def start_http(self):
         if self.http_thread and self.http_thread.is_alive():
@@ -199,6 +208,7 @@ class CamPlayer:
         ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.playing = True
         self.start_ts = time.time()
+        self._last_rx = time.time()
         file_url = 'http://%s:%d/stream.mp3' % (MY_IP, self.port)
         try:
             urllib.request.urlopen(urllib.request.Request(
@@ -257,6 +267,7 @@ class CamPlayer:
                         self.wfile.write(b'%x\r\n' % len(data) + data + b'\r\n')
                         self.wfile.flush()
                         served += len(data)
+                        player._last_rx = time.time()
                 except Exception:
                     pass
                 try:
