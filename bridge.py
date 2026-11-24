@@ -87,7 +87,14 @@ class CamPlayer:
         self.sock = None
         self.http_thread = None
 
+    def start_http(self):
+        if self.http_thread and self.http_thread.is_alive():
+            return
+        self.http_thread = threading.Thread(target=self.serve_http, daemon=True)
+        self.http_thread.start()
+
     def connect(self):
+        self.start_http()
         while True:
             try:
                 self.sock = socket.create_connection((LMS_HOST, LMS_PORT), timeout=10)
@@ -158,7 +165,17 @@ class CamPlayer:
             elif cmd == 't':
                 self.send_stat('STMt', self.elapsed_ms())
             elif cmd == 's':
-                url = p[32:].split(b'\x00')[0].decode('latin1', 'replace')
+                raw = p[24:].split(b'\x00')[0].decode('latin1', 'replace').strip()
+                if raw.startswith('GET '):
+                    # direct streaming: la request_string e' una richiesta HTTP completa
+                    path = raw.split(' ')[1] if ' ' in raw else raw[4:]
+                    sport = struct.unpack('>H', p[18:20])[0] or 80
+                    sip = socket.inet_ntoa(p[20:24])
+                    if sip in ('0.0.0.0', '127.0.0.1'):
+                        sip = LMS_HOST
+                    url = 'http://%s:%d%s' % (sip, sport, path)
+                else:
+                    url = raw
                 log.info('%s: PLAY %s', self.name, url)
                 self.start_play(url)
                 self.send_stat('STMp')
@@ -180,8 +197,6 @@ class CamPlayer:
         ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.playing = True
         self.start_ts = time.time()
-        self.http_thread = threading.Thread(target=self.serve_http, daemon=True)
-        self.http_thread.start()
         file_url = 'http://%s:%d/stream.mp3' % (MY_IP, self.port)
         try:
             urllib.request.urlopen(urllib.request.Request(
@@ -228,11 +243,20 @@ class CamPlayer:
             def log_message(self, *a):
                 pass
 
-        srv = HTTPServer(('0.0.0.0', self.port), H)
-        srv.timeout = 1
-        while self.playing:
-            srv.handle_request()
-        srv.server_close()
+        srv = None
+        while srv is None:
+            try:
+                srv = HTTPServer(('0.0.0.0', self.port), H)
+                srv.timeout = 1
+                log.info('%s: http streamer active on port %d', self.name, self.port)
+            except OSError as e:
+                log.warning('%s: port %d busy (%s), retrying in 5s', self.name, self.port, e)
+                time.sleep(5)
+        while True:
+            try:
+                srv.handle_request()
+            except Exception:
+                time.sleep(0.2)
 
 def main():
     ip = my_ip()
