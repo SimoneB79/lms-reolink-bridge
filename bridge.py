@@ -88,6 +88,8 @@ class CamPlayer:
         self.http_thread = None
         self._http_lock = threading.Lock()
         self._active_conns = set()
+        self._live_conns = set()
+        self._first_byte = False
         self._last_rx = 0.0
         self._rx_bytes = 0
         self._current_url = None
@@ -106,14 +108,16 @@ class CamPlayer:
         while True:
             time.sleep(5)
             if self.playing and not self.paused and self._last_rx and time.time() - self._last_rx > 15:
-                log.info('%s: flusso fermo da 15s, chiudo iniezione', self.name)
-                self.stop_play()
+                log.info('%s: flusso LMS fermo da 15s -> silenzio (canale resta caldo)', self.name)
+                self.playing = False
+                self.send_stat('STMd')
 
     def start_http(self):
         if self.http_thread and self.http_thread.is_alive():
             return
-        self.http_thread = threading.Thread(target=self.serve_http, daemon=True)
+        self.http_thread = threading.Thread(target=self.serve_live, daemon=True)
         self.http_thread.start()
+        threading.Thread(target=self._live_keeper, daemon=True).start()
 
     def connect(self):
         self.start_http()
@@ -236,26 +240,16 @@ class CamPlayer:
     def start_play(self, url):
         self._current_url = url
         self.stop_play()
+        # PCM 24k mono: entra nel canale live (WAV continuo verso go2rtc)
         self.proc = subprocess.Popen([
             'ffmpeg', '-loglevel', 'error', '-rw_timeout', '8000000', '-fflags', 'nobuffer', '-i', url,
             '-af', 'volume=%.2f' % self.vol, '-ar', '24000', '-ac', '1',
-            '-f', 'mp3', '-b:a', '96k', 'pipe:1'
+            '-f', 's16le', 'pipe:1'
         ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.playing = True
+        self._first_byte = False
         self.start_ts = time.time()
         self._last_rx = time.time()
-        file_url = 'http://%s:%d/stream.mp3' % (MY_IP, self.port)
-        threading.Thread(target=self._post_inject, args=(file_url,), daemon=True).start()
-
-    def _post_inject(self, file_url):
-        t0 = time.time()
-        try:
-            urllib.request.urlopen(urllib.request.Request(
-                '%s/api/ffmpeg?dst=%s&file=%s' % (GO2RTC, self.stream, file_url),
-                method='POST'), timeout=30).read()
-            log.info('%s: injected into %s (POST %.1fs)', self.name, self.stream, time.time() - t0)
-        except Exception as e:
-            log.warning('%s: inject POST: %s (flusso comunque attivo)', self.name, e)
 
     def _restart_with_volume(self):
         url = self._current_url
@@ -288,50 +282,54 @@ class CamPlayer:
                 self.proc.kill()
         self.proc = None
 
-    def serve_http(self):
-        # persistent HTTP streamer: lives for the whole player lifetime,
-        # serves the CURRENT ffmpeg process, tracks connections for clean stop
+    def serve_live(self):
+        # canale SEMPRE CALDO: WAV PCM 24k mono infinito (silenzio quando non suona)
         from http.server import BaseHTTPRequestHandler, HTTPServer
+        import select
         player = self
+        RATE = 48000  # bytes/s (24000 Hz * 2)
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):
-                player._active_conns.add(self.connection)
-                try:
-                    self._do_stream()
-                finally:
-                    player._active_conns.discard(self.connection)
-
-            def _do_stream(self):
+                # header WAV streaming (size sconosciuta)
+                hdr = struct.pack('<4sI4s4sIHHIIHH4sI',
+                    b'RIFF', 0xFFFFFFFF, b'WAVE', b'fmt ', 16, 1, 1, 24000, RATE, 2, 16, b'data', 0xFFFFFFFF)
                 self.send_response(200)
-                self.send_header('Content-Type', 'audio/mpeg')
-                self.send_header('Transfer-Encoding', 'chunked')
+                self.send_header('Content-Type', 'audio/wav')
                 self.end_headers()
-                proc = player.proc
-                served = 0
-                first = True
+                self.wfile.write(hdr)
+                player._live_conns.add(self.connection)
+                pending = b''
                 try:
-                    while proc is not None and proc.poll() is None:
-                        data = proc.stdout.read(4096)
-                        if not data:
-                            break
-                        self.wfile.write(b'%x\r\n' % len(data) + data + b'\r\n')
+                    while True:
+                        target = 9600  # 0.2s di audio
+                        out = pending
+                        pending = b''
+                        proc = player.proc
+                        if proc is not None and proc.poll() is None and not player.paused:
+                            r, _, _ = select.select([proc.stdout], [], [], 0.15)
+                            if r:
+                                data = proc.stdout.read1(16384)
+                                if data:
+                                    out += data
+                                    player._rx_bytes += len(data)
+                                    player._last_rx = time.time()
+                                    if not player._first_byte:
+                                        player._first_byte = True
+                                        log.info('%s: primo byte dopo %.1fs', player.name, time.time() - player.start_ts)
+                                        player.send_stat('STMa')
+                                        player.send_stat('STMs')
+                        if len(out) >= target:
+                            self.wfile.write(out[:target])
+                            pending = out[target:]
+                        else:
+                            self.wfile.write(out + b'\x00' * (target - len(out)))
                         self.wfile.flush()
-                        served += len(data)
-                        player._rx_bytes += len(data)
-                        player._last_rx = time.time()
-                        if first:
-                            first = False
-                            log.info('%s: primo byte dopo %.1fs', player.name, time.time() - player.start_ts)
-                            player.send_stat('STMa')
-                            player.send_stat('STMs')
+                        time.sleep(0.2)
                 except Exception:
                     pass
-                try:
-                    self.wfile.write(b'0\r\n\r\n')
-                except Exception:
-                    pass
-                log.info('%s: stream served: %d bytes', player.name, served)
+                finally:
+                    player._live_conns.discard(self.connection)
 
             def log_message(self, *a):
                 pass
@@ -341,15 +339,30 @@ class CamPlayer:
             try:
                 srv = HTTPServer(('0.0.0.0', self.port), H)
                 srv.timeout = 1
-                log.info('%s: http streamer active on port %d', self.name, self.port)
+                log.info('%s: canale live attivo su porta %d (WAV 24k mono)', self.name, self.port)
             except OSError as e:
-                log.warning('%s: port %d busy (%s), retrying in 5s', self.name, self.port, e)
+                log.warning('%s: porta %d occupata (%s), retry in 5s', self.name, self.port, e)
                 time.sleep(5)
         while True:
             try:
                 srv.handle_request()
             except Exception:
                 time.sleep(0.2)
+
+    def _live_keeper(self):
+        # assicura che go2rtc abbia sempre una sessione aperta sul canale live
+        import urllib.request
+        while True:
+            if not self._live_conns:
+                url = 'http://%s:%d/live.wav' % (MY_IP, self.port)
+                try:
+                    threading.Thread(target=lambda: urllib.request.urlopen(urllib.request.Request(
+                        '%s/api/ffmpeg?dst=%s&file=%s' % (GO2RTC, self.stream, url),
+                        method='POST'), timeout=60).read(), daemon=True).start()
+                    log.info('%s: POST canale live -> go2rtc (%s)', self.name, self.stream)
+                except Exception as e:
+                    log.warning('%s: live POST: %s', self.name, e)
+            time.sleep(30)
 
 def main():
     ip = my_ip()
