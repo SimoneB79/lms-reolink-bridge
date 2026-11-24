@@ -92,19 +92,20 @@ class CamPlayer:
         self._rx_bytes = 0
         self._current_url = None
         self._vol_timer = None
+        self.paused = False
 
     def _ticker(self):
         # STAT periodici spontanei: barra di avanzamento fluida
         while True:
             time.sleep(1)
-            if self.playing:
+            if self.playing and not self.paused:
                 self.send_stat('STMt', self.elapsed_ms())
 
     def _watchdog(self):
         # chiude iniezioni rimaste mute (player fermo in LMS, stream senza dati)
         while True:
             time.sleep(5)
-            if self.playing and self._last_rx and time.time() - self._last_rx > 15:
+            if self.playing and not self.paused and self._last_rx and time.time() - self._last_rx > 15:
                 log.info('%s: flusso fermo da 15s, chiudo iniezione', self.name)
                 self.stop_play()
 
@@ -181,14 +182,14 @@ class CamPlayer:
             adjust, gainL = p[8], struct.unpack('>I', p[10:14])[0]
             if adjust and gainL:
                 new = max(0.0, min(1.0, gainL / 100.0))
-                if abs(new - self.vol) > 0.03:
+                if abs(new - self.vol) > 0.06:
                     self.vol = new
                     log.info('%s: volume %.2f', self.name, self.vol)
                     if self.playing and self._current_url:
                         # volume live: riavvia il flusso col nuovo volume (debounce 2.5s)
                         if self._vol_timer:
                             self._vol_timer.cancel()
-                        t = threading.Timer(1.2, self._restart_with_volume)
+                        t = threading.Timer(2.5, self._restart_with_volume)
                         t.daemon = True
                         t.start()
                         self._vol_timer = t
@@ -218,9 +219,15 @@ class CamPlayer:
                 self.start_play(url)
                 self.send_stat('STMh')
             elif cmd == 'p':
-                self.stop_play()
+                # pausa: congela il flusso senza chiuderlo (LMS smette di mandare dati)
+                self.paused = True
                 self.send_stat('STMp')
             elif cmd == 'u':
+                # ripresa: se il flusso e' morto lo riavvio
+                self.paused = False
+                if not (self.proc and self.proc.poll() is None) and self._current_url:
+                    log.info('%s: resume -> riavvio flusso', self.name)
+                    self.start_play(self._current_url)
                 self.send_stat('STMr')
 
     def elapsed_ms(self):
@@ -252,12 +259,17 @@ class CamPlayer:
 
     def _restart_with_volume(self):
         url = self._current_url
-        if url and self.playing:
-            log.info('%s: riavvio flusso con volume %.2f', self.name, self.vol)
-            self.start_play(url)
+        if url and self.playing and not getattr(self, '_restarting', False):
+            self._restarting = True
+            try:
+                log.info('%s: riavvio flusso con volume %.2f', self.name, self.vol)
+                self.start_play(url)
+            finally:
+                self._restarting = False
 
     def stop_play(self):
         self.playing = False
+        self.paused = False
         for c in list(self._active_conns):
             try:
                 c.shutdown(socket.SHUT_RDWR)
