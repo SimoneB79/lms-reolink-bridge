@@ -89,6 +89,7 @@ class CamPlayer:
         self._http_lock = threading.Lock()
         self._active_conns = set()
         self._last_rx = 0.0
+        self._rx_bytes = 0
 
     def _watchdog(self):
         # chiude iniezioni rimaste mute (player fermo in LMS, stream senza dati)
@@ -129,10 +130,14 @@ class CamPlayer:
         self.sock.sendall(pack_msg('SETD', b'\x00' + self.name.encode()))
 
     def send_stat(self, event, ms=0):
+        rx = int(getattr(self, '_rx_bytes', 0))
+        fullness = min(65535, rx)
+        out_full = min(65535, max(0, int((time.time() - getattr(self, 'start_ts', 0)) * 24000))) if self.playing else 0
         payload = struct.pack('>4sBBBIIIIHIIIIHIIH',
             event.encode(), 0, 0, 0,
-            65536, 0, 0, 0, 0xffff, int(time.time() * 1000) & 0x7fffffff,
-            65536, 0, ms // 1000, 0, ms, 0, 0)
+            65536, fullness, (rx >> 32) & 0xffffffff, rx & 0xffffffff,
+            0xffff, int(time.time() * 1000) & 0x7fffffff,
+            65536, out_full, ms // 1000, 0, ms % 1000, 0, 0)
         try:
             self.sock.sendall(pack_msg('STAT', payload))
         except Exception:
@@ -173,9 +178,12 @@ class CamPlayer:
             if cmd in ('q', 'f'):
                 self.stop_play()
                 self.send_stat('STMf')
+                self.send_stat('STMd')
             elif cmd == 't':
                 self.send_stat('STMt', self.elapsed_ms())
             elif cmd == 's':
+                # play: sequenza STAT corretta: CONNECT -> ENDOFHEADERS -> (AUTOSTART/TRACK_STARTED al primo byte)
+                self.send_stat('STMc')
                 raw = p[24:].split(b'\x00')[0].decode('latin1', 'replace').strip()
                 if raw.startswith('GET '):
                     # direct streaming: la request_string e' una richiesta HTTP completa
@@ -189,12 +197,12 @@ class CamPlayer:
                     url = raw
                 log.info('%s: PLAY %s', self.name, url)
                 self.start_play(url)
-                self.send_stat('STMp')
+                self.send_stat('STMh')
             elif cmd == 'p':
                 self.stop_play()
                 self.send_stat('STMp')
             elif cmd == 'u':
-                self.send_stat('STMp')
+                self.send_stat('STMr')
 
     def elapsed_ms(self):
         return int((time.time() - self.start_ts) * 1000) if self.playing else 0
@@ -259,6 +267,7 @@ class CamPlayer:
                 self.end_headers()
                 proc = player.proc
                 served = 0
+                first = True
                 try:
                     while proc is not None and proc.poll() is None:
                         data = proc.stdout.read(4096)
@@ -267,7 +276,12 @@ class CamPlayer:
                         self.wfile.write(b'%x\r\n' % len(data) + data + b'\r\n')
                         self.wfile.flush()
                         served += len(data)
+                        player._rx_bytes += len(data)
                         player._last_rx = time.time()
+                        if first:
+                            first = False
+                            player.send_stat('STMa')
+                            player.send_stat('STMs')
                 except Exception:
                     pass
                 try:
