@@ -86,6 +86,8 @@ class CamPlayer:
         self.start_ts = 0
         self.sock = None
         self.http_thread = None
+        self._http_lock = threading.Lock()
+        self._active_conns = set()
 
     def start_http(self):
         if self.http_thread and self.http_thread.is_alive():
@@ -191,7 +193,7 @@ class CamPlayer:
     def start_play(self, url):
         self.stop_play()
         self.proc = subprocess.Popen([
-            'ffmpeg', '-loglevel', 'error', '-re', '-i', url,
+            'ffmpeg', '-loglevel', 'error', '-re', '-rw_timeout', '8000000', '-i', url,
             '-af', 'volume=%.2f' % self.vol, '-ar', '24000', '-ac', '1',
             '-f', 'mp3', '-b:a', '96k', 'pipe:1'
         ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -208,6 +210,16 @@ class CamPlayer:
 
     def stop_play(self):
         self.playing = False
+        for c in list(self._active_conns):
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._active_conns.clear()
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -217,28 +229,41 @@ class CamPlayer:
         self.proc = None
 
     def serve_http(self):
+        # persistent HTTP streamer: lives for the whole player lifetime,
+        # serves the CURRENT ffmpeg process, tracks connections for clean stop
         from http.server import BaseHTTPRequestHandler, HTTPServer
-        proc = self.proc
+        player = self
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):
+                player._active_conns.add(self.connection)
+                try:
+                    self._do_stream()
+                finally:
+                    player._active_conns.discard(self.connection)
+
+            def _do_stream(self):
                 self.send_response(200)
                 self.send_header('Content-Type', 'audio/mpeg')
                 self.send_header('Transfer-Encoding', 'chunked')
                 self.end_headers()
+                proc = player.proc
+                served = 0
                 try:
-                    while proc and proc.poll() is None:
+                    while proc is not None and proc.poll() is None:
                         data = proc.stdout.read(4096)
                         if not data:
                             break
                         self.wfile.write(b'%x\r\n' % len(data) + data + b'\r\n')
                         self.wfile.flush()
+                        served += len(data)
                 except Exception:
                     pass
                 try:
                     self.wfile.write(b'0\r\n\r\n')
                 except Exception:
                     pass
+                log.info('%s: stream served: %d bytes', player.name, served)
 
             def log_message(self, *a):
                 pass
