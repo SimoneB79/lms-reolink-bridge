@@ -1,0 +1,12 @@
+services:
+  lms-reolink-bridge:
+    build: .
+    container_name: lms-reolink-bridge
+    restart: unless-stopped
+    network_mode: host   # simplest way to reach LMS and go2rtc, and be reachable back
+    environment:
+      LMS_HOST: "192.168.0.10"        # your Lyrion/LMS server
+      LMS_PORT: "3483"
+      GO2RTC_BASE: "http://192.168.0.10:1984"
+      PLAYERS: "Garden:cam_garden:02:00:00:0a:01:01:8101,Porch:cam_porch:02:00:00:0a:02:02:8102"
+      DEFAULT_VOLUME: "0.4"
