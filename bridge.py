@@ -93,6 +93,13 @@ class CamPlayer:
         self._current_url = None
         self._vol_timer = None
 
+    def _ticker(self):
+        # STAT periodici spontanei: barra di avanzamento fluida
+        while True:
+            time.sleep(1)
+            if self.playing:
+                self.send_stat('STMt', self.elapsed_ms())
+
     def _watchdog(self):
         # chiude iniezioni rimaste mute (player fermo in LMS, stream senza dati)
         while True:
@@ -181,7 +188,7 @@ class CamPlayer:
                         # volume live: riavvia il flusso col nuovo volume (debounce 2.5s)
                         if self._vol_timer:
                             self._vol_timer.cancel()
-                        t = threading.Timer(2.5, self._restart_with_volume)
+                        t = threading.Timer(1.2, self._restart_with_volume)
                         t.daemon = True
                         t.start()
                         self._vol_timer = t
@@ -223,7 +230,7 @@ class CamPlayer:
         self._current_url = url
         self.stop_play()
         self.proc = subprocess.Popen([
-            'ffmpeg', '-loglevel', 'error', '-re', '-rw_timeout', '8000000', '-fflags', 'nobuffer', '-i', url,
+            'ffmpeg', '-loglevel', 'error', '-rw_timeout', '8000000', '-fflags', 'nobuffer', '-i', url,
             '-af', 'volume=%.2f' % self.vol, '-ar', '24000', '-ac', '1',
             '-f', 'mp3', '-b:a', '96k', 'pipe:1'
         ], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -231,13 +238,17 @@ class CamPlayer:
         self.start_ts = time.time()
         self._last_rx = time.time()
         file_url = 'http://%s:%d/stream.mp3' % (MY_IP, self.port)
+        threading.Thread(target=self._post_inject, args=(file_url,), daemon=True).start()
+
+    def _post_inject(self, file_url):
+        t0 = time.time()
         try:
             urllib.request.urlopen(urllib.request.Request(
                 '%s/api/ffmpeg?dst=%s&file=%s' % (GO2RTC, self.stream, file_url),
-                method='POST'), timeout=15).read()
-            log.info('%s: audio injected into %s', self.name, self.stream)
+                method='POST'), timeout=30).read()
+            log.info('%s: injected into %s (POST %.1fs)', self.name, self.stream, time.time() - t0)
         except Exception as e:
-            log.warning('%s: inject failed: %s', self.name, e)
+            log.warning('%s: inject POST: %s (flusso comunque attivo)', self.name, e)
 
     def _restart_with_volume(self):
         url = self._current_url
@@ -299,6 +310,7 @@ class CamPlayer:
                         player._last_rx = time.time()
                         if first:
                             first = False
+                            log.info('%s: primo byte dopo %.1fs', player.name, time.time() - player.start_ts)
                             player.send_stat('STMa')
                             player.send_stat('STMs')
                 except Exception:
