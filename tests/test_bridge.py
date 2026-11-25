@@ -157,6 +157,32 @@ class LiveConsumer(threading.Thread):
         return a
 
 
+class StalledConsumer:
+    """Consumer che si collega ma non legge mai (simula un exec orfano)."""
+
+    def __init__(self, port):
+        s = socket.create_connection(('127.0.0.1', port), timeout=10)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        s.sendall(b'GET /live.wav HTTP/1.0\r\nHost: t\r\n\r\n')
+        self.sock = s
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class RstConsumer:
+    """Consumer che chiude con RST subito dopo il GET (write dell'header fallisce)."""
+
+    def __init__(self, port):
+        s = socket.create_connection(('127.0.0.1', port), timeout=10)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        s.sendall(b'GET /live.wav HTTP/1.0\r\nHost: t\r\n\r\n')
+        s.close()
+
+
 class FakeGo2rtc:
     """Finto go2rtc: /api/streams con i producer, POST /api/ffmpeg che attacca
     il consumer al canale live (come fa go2rtc con l'exec ffmpeg)."""
@@ -167,6 +193,9 @@ class FakeGo2rtc:
         self.announcement = False
         self.posts = []
         self.consumer = None
+        self.stall_next = False
+        self.rst_next = False
+        self.stalled = None
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -192,7 +221,13 @@ class FakeGo2rtc:
                     outer.posts.append(time.time())
                     q = parse_qs(urlparse(self.path).query)
                     file = (q.get('file') or [''])[0]
-                    if 'live.wav' in file:
+                    if outer.rst_next:
+                        outer.rst_next = False
+                        RstConsumer(outer.live_port)
+                    elif outer.stall_next:
+                        outer.stall_next = False
+                        outer.stalled = StalledConsumer(outer.live_port)
+                    elif 'live.wav' in file:
                         outer.consumer = LiveConsumer(outer.live_port)
                         outer.consumer.start()
                     self.send_response(200)
@@ -458,6 +493,40 @@ class TestKeeper(unittest.TestCase):
         self.assertTrue(p.announcement_active())
         self.fake.announcement = False
         self.assertFalse(p.announcement_active())
+
+    def _real_consumer_attached(self):
+        c = self.fake.consumer
+        return c is not None and len(c.data) > 4800
+
+    def test_stalled_consumer_is_dropped_and_relinked(self):
+        bridge.CONN_STALL_TIMEOUT = 3.0
+        try:
+            p = self.player
+            self.assertTrue(wait_for(lambda: p._live_conns, timeout=10))
+            self.fake.drop_consumer()
+            self.assertTrue(wait_for(lambda: not p._live_conns, timeout=5))
+            self.fake.consumer = None
+            self.fake.stall_next = True
+            # consumer collegato ma che non legge: dopo il timeout di stallo il
+            # canale si chiude e il keeper ricollega un consumer vero
+            self.assertTrue(wait_for(self._real_consumer_attached, timeout=25),
+                            'canale non ricollegato dopo consumer bloccato')
+            if self.fake.stalled:
+                self.fake.stalled.close()
+        finally:
+            bridge.CONN_STALL_TIMEOUT = 30.0
+
+    def test_rst_consumer_is_discarded_and_relinked(self):
+        p = self.player
+        self.assertTrue(wait_for(lambda: p._live_conns, timeout=10))
+        self.fake.drop_consumer()
+        self.assertTrue(wait_for(lambda: not p._live_conns, timeout=5))
+        self.fake.consumer = None
+        self.fake.rst_next = True
+        # il consumer muore con RST proprio sulla write dell'header: la
+        # connessione va scartata (finally) e il keeper ricollega
+        self.assertTrue(wait_for(self._real_consumer_attached, timeout=15),
+                        'canale non ricollegato dopo RST sull\'header')
 
     def test_recovery_after_consumer_drop(self):
         p = self.player
