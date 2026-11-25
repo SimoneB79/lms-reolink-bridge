@@ -1,75 +1,112 @@
-# LMS Reolink Bridge 🎄🔊
+# lms-reolink-bridge
 
-Turn your **Reolink cameras into virtual Squeezebox players** visible in **Lyrion / Logitech Media Server (LMS)**.
-
-Play music, playlists or radio in Lyrion and the audio comes out of your camera speakers (garden, driveway, front door...). Perfect for background music, announcements or Christmas carols 🎅.
+Play music from **Lyrion Music Server (LMS)** on your **Reolink cameras**: each
+camera shows up in Lyrion as a normal Squeezebox player, and the audio reaches
+the camera speaker through **go2rtc** talkback.
 
 ```
-                ┌─────────────┐   SlimProto    ┌──────────────────────┐
-                │   Lyrion    │◄──────────────►│  lms-reolink-bridge  │
-                │ (LMS)       │  virtual player│  (this container)    │
-                └─────────────┘                └──────────┬───────────┘
-                     ▲ play                          ffmpeg transcode
-                     │                               + volume
-        ┌────────────┴───────────┐            ┌──────────▼───────────┐
-        │  your playlists/radio  │            │        go2rtc        │
-        └────────────────────────┘            └──────────┬───────────┘
-                                                       talkback (PCMU)
-                                                ┌──────────▼───────────┐
-                                                │   Reolink cameras    │
-                                                └──────────────────────┘
+Lyrion (LMS) <--slimproto :3483--> lms-reolink-bridge <--HTTP WAV 24 kHz--> go2rtc <--RTSP talkback PCMU 8 kHz--> Reolink camera
 ```
+
+## Highlights
+
+- Cameras appear as players in Lyrion: play, pause, resume, volume (including
+  Lyrion pause fades and mute), multi-track playlists
+- **Hot channel**: a permanent silent stream per camera, so playback starts in
+  ~0.2 s instead of the 8-12 s of a per-play talkback setup
+- **Software volume** applied directly on PCM samples (instant, no restarts)
+- Correct SlimProto state machine: end-of-track is reported (`STMd`), so
+  playlists advance to the next song and the player stops at the end
+- **Backpressure pacing**: the live channel dictates the real-time pace, so no
+  audio is ever discarded, even if the source delivers faster than real time
+- **Announcements just work**: inject a file/TTS through the go2rtc API
+  (`POST /api/ffmpeg?dst=CAM01&file=...`) and the music pauses, then **resumes
+  automatically** a few seconds after the announcement ends; the bridge checks
+  the go2rtc API and never interrupts an announcement in progress
+- Robust keeper: re-attaches the camera channel after go2rtc/camera restarts
+  (poll 2 s, retry 5 s), with clean logs
+- Single Python file, standard library only (plus ffmpeg in the image)
 
 ## Requirements
-- A working **Lyrion Music Server** (any recent version)
-- **go2rtc** with your Reolink cameras already configured as sources (the bridge injects audio through `go2rtc /api/ffmpeg`, using the camera talkback channel — supported by most Reolink models)
-- Docker
 
-## Install
-```bash
-git clone https://github.com/SimoneB79/lms-reolink-bridge.git
-cd lms-reolink-bridge
-# edit compose.yaml: LMS_HOST, GO2RTC_BASE and your PLAYERS
-docker compose up -d --build
+- Lyrion Music Server 9.x (slimproto port 3483 reachable from the bridge)
+- go2rtc 1.9.x with your Reolink streams configured (the camera must support
+  two-way audio / PCMU talkback)
+- Docker (recommended) or Python 3.12+ with ffmpeg on PATH
+
+## Quick start
+
+```yaml
+# compose.yaml
+services:
+  lms-cam-bridge:
+    build: .
+    container_name: lms-cam-bridge
+    restart: unless-stopped
+    network_mode: host        # go2rtc must reach the bridge HTTP ports
+    environment:
+      LMS_HOST: "192.168.0.10"
+      LMS_PORT: "3483"
+      GO2RTC_BASE: "http://192.168.0.10:1984"
+      PLAYERS: "CAM01:CAM01:02:00:00:0d:01:01:8101,CAM02:CAM02:02:00:00:0d:02:02:8102,CAM03:CAM03:02:00:00:0d:03:03:8103"
+      DEFAULT_VOLUME: "0.3"
 ```
-Open Lyrion: the new players appear in the player list. Rename them there if you like. Press Play — done.
 
-## Configuration (environment)
+```bash
+docker compose up -d --build   # after any change: rebuild (COPY happens at build time)
+docker logs -f lms-cam-bridge
+```
+
+Then open Lyrion: the players appear (rename them as you like from the Lyrion
+UI). Play something and set the volume from Lyrion: the slider works, with the
+same perceptual curve as a real player.
+
+## Configuration
+
 | Variable | Default | Description |
 |---|---|---|
-| `LMS_HOST` | localhost | Lyrion/LMS server address |
-| `LMS_PORT` | 3483 | SlimProto port |
-| `GO2RTC_BASE` | http://localhost:1984 | go2rtc base URL |
-| `PLAYERS` | — | comma separated `NAME:GO2RTC_STREAM:MAC:HTTP_PORT` |
-| `DEFAULT_VOLUME` | 0.4 | initial volume (0..1) |
-| `LOG_LEVEL` | INFO | python logging level |
+| `LMS_HOST` | localhost | Lyrion host |
+| `LMS_PORT` | 3483 | slimproto port |
+| `GO2RTC_BASE` | http://localhost:1984 | go2rtc API base URL |
+| `PLAYERS` | required | comma list of `NAME:GO2RTC_STREAM:MAC:HTTP_PORT`; the MAC must be unique per player |
+| `DEFAULT_VOLUME` | 0.4 | volume (0-1) before the first volume command from Lyrion |
+| `LOG_LEVEL` | INFO | logging level |
 
-Each player needs a **unique fake MAC** (e.g. `02:00:00:0a:01:01`) and a **unique HTTP port** (8101, 8102...). `GO2RTC_STREAM` is the source name exactly as configured in go2rtc.
+## Announcements / TTS
 
-## What works
-- Play / Pause / Stop from Lyrion (web, Material Skin, apps)
-- Playlists and radio stations
-- Volume slider (applied at track start)
-- Multiple cameras at once (one virtual player each)
+Inject audio on the same camera through the go2rtc API:
 
-## Honest limitations
-- Audio goes through the camera **talkback channel (PCMU, 8 kHz)**: intercom quality. Great for announcements and background music, not for hi-fi.
-- Camera speakers are small: keep volume moderate.
-- Volume changes apply at the start of the next track.
-
-## Uninstall
 ```bash
-docker compose down --volumes
+curl -X POST "http://go2rtc:1984/api/ffmpeg?dst=CAM03&file=https://example/chime.mp3"
 ```
-The bridge registers nothing on the cameras; the players can be removed from Lyrion's player management if you don't want them listed.
 
-## How it was built
-The SlimProto protocol details were reverse-engineered from squeezelite and the LMS sources. Two non-obvious findings worth remembering:
-- server→client frames use a 2-byte length **that includes the opcode**; client→server frames use a 4-byte length (big endian, payload only)
-- the player **must declare supported formats as single-word capabilities** in HELO (`mp3,flc,ogg,aif,pcm`): without them LMS silently refuses to start playback
+The announcement takes over the camera speaker; the music stops at the source
+(nothing is lost) and resumes from the same position a few seconds after the
+announcement ends.
 
-## Credits
-Built by Simone (SimoneB79) with the help of OpenClaw. Inspired by the squeezelite player protocol.
+## Limitations
+
+- Reolink talkback audio is 8 kHz mu-law: telephone quality. Fine for
+  background music and announcements, not hi-fi
+- The camera audio channel is held open permanently (that is what makes the
+  start instant); a per-play mode is possible but adds 8-12 s of latency
+- Run only one bridge instance against the same Lyrion (player MACs must be
+  unique)
+
+## Tests
+
+Fully offline, loopback only: no real Lyrion, go2rtc or cameras involved.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite covers volume parsing (Lyrion sends 16.16 fixed-point gains), the
+volume applied on the live channel, default volume, end-of-track events,
+failed sources, server stop, pause/resume, two-track playlists, pacing of
+over-producing sources, odd-length PCM chunks, keeper resilience and the
+announcement-aware recovery.
 
 ## License
-MIT — see LICENSE.
+
+MIT
