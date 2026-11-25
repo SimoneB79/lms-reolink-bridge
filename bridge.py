@@ -11,11 +11,28 @@ v2 design:
   - single live session per camera, with keeper + duplicate detection
   - correct SlimProto state machine (STMc/STMh/STMa/STMs/STMt/STMp/STMr/STMf)
 
+v2.2 (25/11/2026): keeper announcement-aware - controlla via API se un altro
+  ffmpeg (annuncio TTS) sta usando lo stream go2rtc: in quel caso attende;
+  altrimenti re-inietta il canale entro 5 s (prima: fino a 40 s di musica
+  fermi dopo un annuncio). Retry/poll 5 s / 2 s.
+
+v2.1 fixes (25/11/2026):
+  - audg: Lyrion sends gains as 16.16 fixed point (65536 = 0 dB), NOT 0-100:
+    the old parse collapsed any value to 1.00 and ignored 0 (volume always
+    full, mute broken). Now vol = newL/65536, always applied; Q15 gain.
+  - end of track: when the source ends, send STAT 'STMd' (decoder has no more
+    data) so Lyrion advances to the next song or stops; on source failure send
+    'STMn'. v2.0 never sent them: the player stayed in "play" forever at the
+    end of the track and a playlist never went past the first song.
+  - keeper: POST to go2rtc wrapped in try/except (no traceback while the stack
+    is restarting)
+  - PCM chunks with odd length no longer corrupt the s16le sample alignment
+
 Environment:
   LMS_HOST, LMS_PORT (3483), GO2RTC_BASE, DEFAULT_VOLUME, LOG_LEVEL,
   PLAYERS = "NAME:GO2RTC_STREAM:MAC:HTTP_PORT,..."
 """
-import os, socket, struct, subprocess, threading, time, urllib.request, logging
+import json, os, socket, struct, subprocess, threading, time, urllib.request, logging
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import array
 
@@ -39,6 +56,9 @@ if not PLAYERS:
 CAPS = 'Model=reolink-bridge,AccuratePlayPoints=1,HasDigitalOut=1,Firmware=2.0,mp3,flc,ogg,aif,pcm'
 RATE = 48000          # bytes/s of 24kHz s16le mono
 CHUNK = 9600          # 200ms of audio
+VERSION = '2.2'
+KEEPER_POLL = 2.0     # s: quanto spesso il keeper controlla il consumer
+KEEPER_RETRY = 5.0    # s: attesa tra i tentativi di (ri)iniezione del canale
 
 MY_IP = None
 
@@ -48,14 +68,18 @@ def pack_msg(op, payload):
 
 
 def apply_volume(data, vol):
-    """Gain on s16le samples (software volume: instant, no restarts)."""
+    """Gain on s16le samples (software volume: instant, no restarts).
+
+    Q15 fixed-point gain: identity at vol=1.0, fine resolution at low volumes
+    (a Q8 gain collapsed anything below ~1/256 to silence).
+    """
     if vol >= 0.995:
         return data
     a = array.array('h')
     a.frombytes(data)
-    v = int(vol * 256)
+    v = int(round(vol * 32768))
     for i in range(len(a)):
-        x = (a[i] * v) >> 8
+        x = (a[i] * v) >> 15
         if x > 32767:
             x = 32767
         elif x < -32768:
@@ -79,6 +103,10 @@ class CamPlayer:
         self._start_ts = 0.0
         self._first_byte = False
         self._live_conns = set()
+        self._pcm_tail = b''      # odd byte of a chunk: keeps s16le alignment
+        self._eof_signalled = False
+        self._paused_total = 0.0    # tempo accumulato in pausa (elapsed onesto)
+        self._pause_started = None
 
     # ---------------- slimproto client ----------------
     def connect(self):
@@ -135,10 +163,15 @@ class CamPlayer:
         if op == 'setd' and p and p[0] == 0:
             self.sock.sendall(pack_msg('SETD', b'\x00' + self.name.encode()))
         elif op == 'audg' and len(p) >= 18:
-            adjust, gainL = p[8], struct.unpack('>I', p[10:14])[0]
-            if adjust and gainL:
-                self.vol = max(0.0, min(1.0, gainL / 100.0))
-                log.info('%s: volume %.2f (software, immediato)', self.name, self.vol)
+            # Lyrion 'audg' (Squeezebox2.pm): pack('NNCCNN', oldL, oldR, dvc,
+            # preamp, newL, newR) [+ trailing seq]: no MAC in the payload.
+            # Gains are 16.16 fixed point: 65536 = 0 dB (unity).
+            new_l = struct.unpack('>I', p[10:14])[0]
+            v = min(1.0, new_l / 65536.0)
+            if v != self.vol:
+                log.info('%s: volume %.3f (gain %d, software immediato)',
+                         self.name, v, new_l)
+            self.vol = v
         elif op == 'strm':
             cmd = chr(p[0]) if p else ''
             if cmd in ('s', 'p', 'u', 'q', 'f'):
@@ -161,8 +194,13 @@ class CamPlayer:
                 self.send_stat('STMh')
             elif cmd == 'p':
                 self.paused = True
+                if self._pause_started is None:
+                    self._pause_started = time.time()
                 self.send_stat('STMp')
             elif cmd == 'u':
+                if self._pause_started is not None:
+                    self._paused_total += time.time() - self._pause_started
+                    self._pause_started = None
                 self.paused = False
                 if not (self.proc and self.proc.poll() is None) and self._current_url:
                     self.start_play(self._current_url)
@@ -174,7 +212,13 @@ class CamPlayer:
                 self.send_stat('STMt', self.elapsed_ms())
 
     def elapsed_ms(self):
-        return int((time.time() - self._start_ts) * 1000) if self.playing else 0
+        if not self.playing:
+            return 0
+        now = time.time()
+        paused = self._paused_total
+        if self._pause_started is not None:
+            paused += now - self._pause_started
+        return int((now - self._start_ts - paused) * 1000)
 
     # ---------------- audio source ----------------
     def start_play(self, url):
@@ -187,6 +231,10 @@ class CamPlayer:
         self.playing = True
         self.paused = False
         self._first_byte = False
+        self._eof_signalled = False
+        self._pcm_tail = b''
+        self._paused_total = 0.0
+        self._pause_started = None
         self._start_ts = time.time()
         self._last_rx = time.time()
 
@@ -199,6 +247,34 @@ class CamPlayer:
                 self.proc.wait(3)
             except Exception:
                 self.proc.kill()
+        self.proc = None
+
+    def take_even(self, data):
+        """Prepend the leftover byte and return only s16le-aligned bytes
+        (an odd trailing byte is kept for the next chunk)."""
+        data = self._pcm_tail + data
+        if len(data) & 1:
+            self._pcm_tail = data[-1:]
+            return data[:-1]
+        self._pcm_tail = b''
+        return data
+
+    def source_finished(self, returncode):
+        """Source ended (not by a server command): tell Lyrion.
+
+        STMd = 'decoder has no more data' -> Lyrion advances to the next song
+        or ends the playlist; STMn = source failed -> it skips it.
+        """
+        if self._eof_signalled or not self.playing:
+            return
+        self._eof_signalled = True
+        if self._first_byte and returncode == 0:
+            log.info('%s: fine traccia -> STMd', self.name)
+            self.send_stat('STMd')
+        else:
+            log.info('%s: sorgente fallita (rc=%s) -> STMn', self.name, returncode)
+            self.send_stat('STMn')
+        self.playing = False
         self.proc = None
 
     # ---------------- hot channel ----------------
@@ -227,20 +303,27 @@ class CamPlayer:
                         out = pending
                         pending = b''
                         proc = player.proc
-                        if proc is not None and proc.poll() is None and not player.paused:
+                        # backpressure: si legge solo cio' che il canale puo'
+                        # suonare (rate tempo reale). ffmpeg resta bloccato
+                        # sulla pipe piena: nessuno scarto di audio.
+                        if (proc is not None and proc.poll() is None
+                                and not player.paused and len(out) < CHUNK):
                             r, _, _ = select.select([proc.stdout], [], [], 0.15)
                             if r:
-                                data = proc.stdout.read1(16384)
+                                data = proc.stdout.read1(
+                                    min(16384, 2 * CHUNK - len(out)))
                                 if data:
-                                    if not player._first_byte:
-                                        player._first_byte = True
-                                        log.info('%s: primo byte dopo %.1fs', player.name,
-                                                 time.time() - player._start_ts)
-                                        player.send_stat('STMa')
-                                        player.send_stat('STMs')
-                                    out += apply_volume(data, player.vol)
-                                    player._rx_bytes += len(data)
-                                    player._last_rx = time.time()
+                                    data = player.take_even(data)
+                                    if data:
+                                        if not player._first_byte:
+                                            player._first_byte = True
+                                            log.info('%s: primo byte dopo %.1fs', player.name,
+                                                     time.time() - player._start_ts)
+                                            player.send_stat('STMa')
+                                            player.send_stat('STMs')
+                                        out += apply_volume(data, player.vol)
+                                        player._rx_bytes += len(data)
+                                        player._last_rx = time.time()
                         if len(out) >= CHUNK:
                             self.wfile.write(out[:CHUNK])
                             pending = out[CHUNK:]
@@ -250,6 +333,12 @@ class CamPlayer:
                         else:
                             self.wfile.write(out + b'\x00' * (CHUNK - len(out)))
                         self.wfile.flush()
+                        # source ended (not by command): signal Lyrion once,
+                        # after all pending audio has been written
+                        if (player.playing and not player.paused
+                                and player.proc is not None and not pending
+                                and player.proc.poll() is not None):
+                            player.source_finished(player.proc.returncode)
                         time.sleep(0.2)
                 except Exception:
                     pass
@@ -274,24 +363,55 @@ class CamPlayer:
             except Exception:
                 time.sleep(0.2)
 
+    def announcement_active(self):
+        """True se un altro ffmpeg (es. annuncio TTS via API go2rtc) sta
+        usando lo stream: in quel caso non re-iniettiamo il canale, perche'
+        go2rtc Play() fermerebbe l'annuncio in corso."""
+        try:
+            with urllib.request.urlopen(GO2RTC + '/api/streams', timeout=5) as r:
+                data = json.loads(r.read().decode('utf-8', 'replace'))
+        except Exception:
+            return False   # API non leggibile: non bloccare il recovery
+        st = data.get('streams', data).get(self.stream) if isinstance(data, dict) else None
+        if not isinstance(st, dict):
+            return False
+        for p in st.get('producers') or []:
+            if not isinstance(p, dict):
+                continue
+            src = str(p.get('source') or '')
+            if 'exec:' in src and 'live.wav' not in src:
+                return True
+        return False
+
+    def _post_live(self):
+        url = 'http://%s:%d/live.wav' % (MY_IP, self.port)
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                '%s/api/ffmpeg?dst=%s&file=%s' % (GO2RTC, self.stream, url),
+                method='POST'), timeout=60).read()
+        except Exception as e:
+            log.warning('%s: keeper: POST go2rtc non riuscito (%s)', self.name, e)
+
     def live_keeper(self):
         while True:
             try:
-                if not self._live_conns:
-                    url = 'http://%s:%d/live.wav' % (MY_IP, self.port)
+                if self._live_conns:
+                    # duplicate detection: piu' di una connessione = audio sovrapposto
+                    if len(self._live_conns) > 1:
+                        log.warning('%s: %d connessioni live (rischio sovrapposizione!)',
+                                    self.name, len(self._live_conns))
+                    time.sleep(KEEPER_POLL)
+                elif self.announcement_active():
+                    # un annuncio (altro exec ffmpeg) usa lo stream: aspetto,
+                    # perche' la re-iniezione lo interromperebbe
+                    time.sleep(KEEPER_POLL)
+                else:
                     log.info('%s: (ri)apertura canale live -> %s', self.name, self.stream)
-                    threading.Thread(target=lambda: urllib.request.urlopen(urllib.request.Request(
-                        '%s/api/ffmpeg?dst=%s&file=%s' % (GO2RTC, self.stream, url),
-                        method='POST'), timeout=60).read(), daemon=True).start()
-                    time.sleep(30)
-                # duplicate detection: piu' di una connessione = audio sovrapposto
-                if len(self._live_conns) > 1:
-                    log.warning('%s: %d connessioni live (rischio sovrapposizione!)',
-                                self.name, len(self._live_conns))
-                time.sleep(10)
+                    threading.Thread(target=self._post_live, daemon=True).start()
+                    time.sleep(KEEPER_RETRY)
             except Exception as e:
                 log.warning('%s: keeper: %s', self.name, e)
-                time.sleep(15)
+                time.sleep(KEEPER_POLL)
 
     def status_ticker(self):
         while True:
@@ -308,8 +428,8 @@ def main():
         MY_IP = s.getsockname()[0]
     finally:
         s.close()
-    log.info('bridge v2.0: LMS=%s:%s go2rtc=%s ip=%s players=%d',
-             LMS_HOST, LMS_PORT, GO2RTC, MY_IP, len(PLAYERS))
+    log.info('bridge v%s: LMS=%s:%s go2rtc=%s ip=%s players=%d',
+             VERSION, LMS_HOST, LMS_PORT, GO2RTC, MY_IP, len(PLAYERS))
     for cfg in PLAYERS:
         threading.Thread(target=CamPlayer(*cfg).connect, daemon=True).start()
     while True:
