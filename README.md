@@ -24,7 +24,9 @@ Lyrion (LMS) <--slimproto :3483--> lms-reolink-bridge <--HTTP WAV 24 kHz--> go2r
   automatically** a few seconds after the announcement ends; the bridge checks
   the go2rtc API and never interrupts an announcement in progress
 - Robust keeper: re-attaches the camera channel after go2rtc/camera restarts
-  (poll 2 s, retry 5 s), with clean logs
+  (poll 2 s, retry 5 s), never interrupts an announcement in progress, and
+  drops stalled consumers automatically (a dead go2rtc exec can no longer
+  hold the channel hostage)
 - Single Python file, standard library only (plus ffmpeg in the image)
 
 ## Requirements
@@ -101,11 +103,11 @@ Fully offline, loopback only: no real Lyrion, go2rtc or cameras involved.
 python3 -m unittest discover -s tests -v
 ```
 
-The suite covers volume parsing (Lyrion sends 16.16 fixed-point gains), the
-volume applied on the live channel, default volume, end-of-track events,
-failed sources, server stop, pause/resume, two-track playlists, pacing of
-over-producing sources, odd-length PCM chunks, keeper resilience and the
-announcement-aware recovery.
+The suite (18 tests) covers volume parsing (Lyrion sends 16.16 fixed-point
+gains), the volume applied on the live channel, default volume, end-of-track
+events, failed sources, server stop, pause/resume, two-track playlists, pacing
+of over-producing sources, odd-length PCM chunks, keeper resilience, the
+announcement-aware recovery and the stalled/zombie consumer protection.
 
 ## License
 
