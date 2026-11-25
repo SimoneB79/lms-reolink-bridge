@@ -11,6 +11,12 @@ v2 design:
   - single live session per camera, with keeper + duplicate detection
   - correct SlimProto state machine (STMc/STMh/STMa/STMs/STMt/STMp/STMr/STMf)
 
+v2.3 (25/11/2026): canale live robusto ai consumer bloccati (zombie): timeout
+  di stallo 30 s su ogni connessione, pulizia garantita in finally (anche se
+  la scrittura dell'header fallisce), iniezioni scaglionate all'avvio
+  (2 s tra le camere: evita SETUP simultanei alle camere) e avviso dopo 5
+  tentativi falliti (con cadenza piu' lenta).
+
 v2.2 (25/11/2026): keeper announcement-aware - controlla via API se un altro
   ffmpeg (annuncio TTS) sta usando lo stream go2rtc: in quel caso attende;
   altrimenti re-inietta il canale entro 5 s (prima: fino a 40 s di musica
@@ -56,9 +62,11 @@ if not PLAYERS:
 CAPS = 'Model=reolink-bridge,AccuratePlayPoints=1,HasDigitalOut=1,Firmware=2.0,mp3,flc,ogg,aif,pcm'
 RATE = 48000          # bytes/s of 24kHz s16le mono
 CHUNK = 9600          # 200ms of audio
-VERSION = '2.2'
+VERSION = '2.3'
 KEEPER_POLL = 2.0     # s: quanto spesso il keeper controlla il consumer
 KEEPER_RETRY = 5.0    # s: attesa tra i tentativi di (ri)iniezione del canale
+CONN_STALL_TIMEOUT = 30.0   # s: consumer che non legge -> si chiude il canale
+KEEPER_WARN_AFTER = 5       # tentativi prima di avvisare che il canale non attacca
 
 MY_IP = None
 
@@ -291,14 +299,22 @@ class CamPlayer:
                 hdr = struct.pack('<4sI4s4sIHHIIHH4sI',
                                   b'RIFF', 0xFFFFFFFF, b'WAVE', b'fmt ', 16, 1, 1, 24000, RATE, 2, 16,
                                   b'data', 0xFFFFFFFF)
-                self.send_response(200)
-                self.send_header('Content-Type', 'audio/wav')
-                self.end_headers()
-                self.wfile.write(hdr)
-                player._live_conns.add(self.connection)
                 pending = b''
                 import select
+                player._live_conns.add(self.connection)
                 try:
+                    # consumer che smette di leggere (go2rtc morto/exec orfano):
+                    # buffer di invio piccolo + timeout -> il keeper ricollega presto
+                    self.connection.settimeout(CONN_STALL_TIMEOUT)
+                    try:
+                        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF,
+                                                   2 * CHUNK)
+                    except OSError:
+                        pass
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'audio/wav')
+                    self.end_headers()
+                    self.wfile.write(hdr)
                     while True:
                         out = pending
                         pending = b''
@@ -343,6 +359,10 @@ class CamPlayer:
                 except Exception:
                     pass
                 finally:
+                    try:
+                        self.connection.close()
+                    except Exception:
+                        pass
                     player._live_conns.discard(self.connection)
 
             def log_message(self, *a):
@@ -393,9 +413,11 @@ class CamPlayer:
             log.warning('%s: keeper: POST go2rtc non riuscito (%s)', self.name, e)
 
     def live_keeper(self):
+        failures = 0
         while True:
             try:
                 if self._live_conns:
+                    failures = 0
                     # duplicate detection: piu' di una connessione = audio sovrapposto
                     if len(self._live_conns) > 1:
                         log.warning('%s: %d connessioni live (rischio sovrapposizione!)',
@@ -406,9 +428,14 @@ class CamPlayer:
                     # perche' la re-iniezione lo interromperebbe
                     time.sleep(KEEPER_POLL)
                 else:
+                    failures += 1
+                    if failures == KEEPER_WARN_AFTER:
+                        log.warning('%s: canale live non agganciato dopo %d tentativi: '
+                                    'talkback bloccato? riavviare go2rtc (frigate)',
+                                    self.name, failures)
                     log.info('%s: (ri)apertura canale live -> %s', self.name, self.stream)
                     threading.Thread(target=self._post_live, daemon=True).start()
-                    time.sleep(KEEPER_RETRY)
+                    time.sleep(KEEPER_RETRY if failures < KEEPER_WARN_AFTER else 30.0)
             except Exception as e:
                 log.warning('%s: keeper: %s', self.name, e)
                 time.sleep(KEEPER_POLL)
@@ -432,6 +459,9 @@ def main():
              VERSION, LMS_HOST, LMS_PORT, GO2RTC, MY_IP, len(PLAYERS))
     for cfg in PLAYERS:
         threading.Thread(target=CamPlayer(*cfg).connect, daemon=True).start()
+        # iniezioni scaglionate: SETUP simultanei verso piu' camere
+        # vengono rifiutati dalle Reolink
+        time.sleep(2.0)
     while True:
         time.sleep(60)
 
